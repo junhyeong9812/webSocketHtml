@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sockjs-client/1.6.1/sockjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+    <style>
+        .container { max-width: 800px; margin: 20px auto; padding: 20px; }
+        .section { margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; }
+        .log { height: 200px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; background: #f5f5f5; font-family: monospace; }
+        .input-group { margin: 10px 0; }
+        .error { color: red; }
+        .warning { color: orange; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>WebSocket Test</h2>
+        
+        <div class="section">
+            <h3>Connection Settings</h3>
+            <div class="input-group">
+                <label>Token (without 'Bearer '): </label><br>
+                <input type="text" id="tokenInput" style="width: 100%" 
+                       placeholder="Paste your JWT token here">
+            </div>
+            <button onclick="validateAndConnect()">Connect</button>
+            <button onclick="disconnect()">Disconnect</button>
+            <div id="connectionLog" class="log"></div>
+        </div>
+
+        <div class="section">
+            <h3>Chat Test</h3>
+            <div class="input-group">
+                <label>Room ID: </label>
+                <input type="text" id="chatRoomId" placeholder="Enter room ID">
+            </div>
+            <div class="input-group">
+                <label>Message: </label>
+                <input type="text" id="chatMessage" placeholder="Type message">
+            </div>
+            <button onclick="subscribeChatRoom()">Subscribe Chat</button>
+            <button onclick="sendChatMessage()">Send Message</button>
+            <div id="chatLog" class="log"></div>
+        </div>
+    </div>
+
+    <script>
+        let stompClient = null;
+        let socket = null;
+        let currentToken = null;
+        let reconnectTimer = null;
+        const RECONNECT_INTERVAL = 5000; // 5초
+
+        function getAuthHeaders() {
+            return {
+                'Authorization': 'Bearer ' + currentToken,
+                'content-type': 'application/json'
+            };
+        }
+
+        function validateToken(token) {
+            if (!token) {
+                return { isValid: false, message: 'Token is required' };
+            }
+
+            const parts = token.split('.');
+            if (parts.length !== 3) {
+                return { isValid: false, message: 'Invalid JWT format' };
+            }
+
+            try {
+                const payload = JSON.parse(atob(parts[1]));
+                const now = Date.now() / 1000;
+                
+                if (!payload.exp) {
+                    return { isValid: false, message: 'Token has no expiration' };
+                }
+
+                if (payload.exp < now) {
+                    return { isValid: false, message: 'Token has expired' };
+                }
+
+                // 만료 10분 전 경고
+                if (payload.exp - now < 600) {
+                    return { 
+                        isValid: true, 
+                        warning: `Token will expire in ${Math.floor((payload.exp - now) / 60)} minutes`,
+                        payload 
+                    };
+                }
+
+                return { 
+                    isValid: true, 
+                    message: 'Token is valid', 
+                    payload,
+                    expiresIn: Math.floor((payload.exp - now) / 60)
+                };
+            } catch (e) {
+                return { isValid: false, message: 'Invalid token format: ' + e.message };
+            }
+        }
+
+        function validateAndConnect() {
+            const token = document.getElementById('tokenInput').value.trim();
+            const validation = validateToken(token);
+            
+            if (!validation.isValid) {
+                log('connection', validation.message, 'error');
+                return;
+            }
+
+            if (validation.warning) {
+                log('connection', validation.warning, 'warning');
+            } else {
+                log('connection', `Token is valid and will expire in ${validation.expiresIn} minutes`, 'success');
+            }
+
+            currentToken = token;
+            connect();
+        }
+
+        function connect() {
+            try {
+                // 이미 연결 시도 중이면 리턴
+                if (socket && socket.readyState !== WebSocket.CLOSED) {
+                    log('connection', 'Already connecting or connected');
+                    return;
+                }
+
+                log('connection', 'Connecting...');
+                socket = new SockJS('http://localhost:8080/ws');
+                stompClient = Stomp.over(socket);
+
+                stompClient.debug = function(str) {
+                    log('connection', 'STOMP: ' + str);
+                };
+
+                stompClient.connect(
+                    getAuthHeaders(), 
+                    function(frame) {
+                        log('connection', 'Connected: ' + frame, 'success');
+                        clearReconnectTimer(); // 연결 성공시 타이머 클리어
+                    },
+                    function(error) {
+                        log('connection', 'Error: ' + error, 'error');
+                        handleDisconnect();
+                    }
+                );
+            } catch (e) {
+                log('connection', 'Connection error: ' + e.message, 'error');
+                handleDisconnect();
+            }
+        }
+
+        function handleDisconnect() {
+            // 연결 상태 초기화
+            stompClient = null;
+            socket = null;
+
+            // 재연결 타이머 설정
+            clearReconnectTimer();
+            reconnectTimer = setTimeout(() => {
+                log('connection', 'Attempting to reconnect...', 'warning');
+                connect();
+            }, RECONNECT_INTERVAL);
+        }
+
+        function clearReconnectTimer() {
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+        }
+
+        function disconnect() {
+            clearReconnectTimer(); // 수동 연결 해제시 재연결 타이머 클리어
+            
+            if (stompClient) {
+                stompClient.disconnect();
+                log('connection', 'Disconnected');
+            }
+            if (socket) {
+                socket.close();
+            }
+            stompClient = null;
+            socket = null;
+            currentToken = null;
+        }
+
+        function subscribeChatRoom() {
+           if (!stompClient || !currentToken) {
+               log('chat', 'Error: Not connected', 'error');
+               return;
+           }
+
+           const roomId = parseInt(document.getElementById('chatRoomId').value);
+           if (!roomId) {
+               log('chat', 'Error: Room ID is required', 'error');
+               return;
+           }
+
+           try {
+               stompClient.subscribe(`/user/topic/chat/${roomId}`, function(message) {
+                   log('chat', 'Received: ' + message.body, 'success');
+               }, getAuthHeaders());
+
+               stompClient.send(
+                   `/app/chat.subscribe/${roomId}`, 
+                   getAuthHeaders(),
+                   JSON.stringify({})
+               );
+               
+               log('chat', `Subscribed to chat room ${roomId}`, 'success');
+           } catch (error) {
+               log('chat', `Subscribe error: ${error.message}`, 'error');
+           }
+       }
+
+        function sendChatMessage() {
+           if (!stompClient || !currentToken) {
+               log('chat', 'Error: Not connected', 'error');
+               return;
+           }
+
+           const roomId = parseInt(document.getElementById('chatRoomId').value);
+           const message = document.getElementById('chatMessage').value;
+
+           if (!roomId || !message) {
+               log('chat', 'Error: Room ID and message are required', 'error');
+               return;
+           }
+
+           try {
+               stompClient.send(
+                   `/app/chat.send/${roomId}`, 
+                   getAuthHeaders(),
+                   JSON.stringify({
+                       content: message
+                   })
+               );
+               
+               document.getElementById('chatMessage').value = '';
+               log('chat', `Sent message to room ${roomId}: ${message}`, 'success');
+           } catch (error) {
+               log('chat', `Send error: ${error.message}`, 'error');
+           }
+       }
+
+        function log(area, message, type = '') {
+            const log = document.getElementById(area + 'Log');
+            const time = new Date().toLocaleTimeString('ko-KR', {
+                hour12: false,
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                fractionalSecondDigits: 3
+            });
+            log.innerHTML += `<div class="${type}">[${time}] ${message}</div>`;
+            log.scrollTop = log.scrollHeight;
+        }
+    </script>
+</body>
+</html>
